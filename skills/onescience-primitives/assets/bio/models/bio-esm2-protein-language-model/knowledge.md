@@ -71,3 +71,35 @@ with torch.no_grad():
 
 ## 证据来源
 [1] Lin et al., "Evolutionary-scale prediction of atomic-level protein structure with a language model", Science, 2023, DOI: 10.1126/science.ade2574
+
+## resource_acquisition（结构化获取契约）
+
+`esm.pretrained.esm2_t33_650M_UR50D()` 默认从 fair-esm 的远端 URL 拉权重，沙箱/内网常不可达。
+orchestrator 应按下述**镜像优先**顺序主动获取，取不到再降级；不要停在"下载失败"就放弃。
+
+```yaml
+resource_acquisition:
+  - dep: fair-esm                            # ESM-2 运行库
+    kind: tool
+    source:
+      - {provider: pypi, id: fair-esm}
+    command: "python3 -m pip install fair-esm torch"
+    on_missing: fetch
+    verify: "python3 -c 'import esm; print(esm.__file__)'"
+
+  - dep: esm2_t33_650M_UR50D-weights         # 650M 权重（CPU 友好的默认档）
+    kind: model_weights
+    source:
+      - {provider: hf-mirror,   id: facebook/esm2_t33_650M_UR50D, endpoint: "https://hf-mirror.com"}
+      - {provider: huggingface, id: facebook/esm2_t33_650M_UR50D}
+      - {provider: modelscope,  id: "OneScience/ESM（平台镜像，如可用优先）"}
+    command: |
+      python3 -m pip install -U "huggingface_hub[cli]" transformers
+      export HF_ENDPOINT=https://hf-mirror.com
+      hf download facebook/esm2_t33_650M_UR50D --local-dir ./esm2_weights
+      # 加载：from transformers import AutoModel; AutoModel.from_pretrained("./esm2_weights")
+    sha256: 待核验
+    size_hint: "~2.5GB（650M）"
+    on_missing: fetch
+    degrade_to: "无网络/无 GPU：用 esm2_t30_150M 或 t12_35M 小模型在 CPU 上做序列表征冒烟，声明降档"
+```

@@ -232,3 +232,57 @@ AtomicData 图字段
 - `{onescience_path}/onescience/examples/matchem/mace/demo/configs/*.yaml`
 - `{onescience_path}/onescience/examples/matchem/mace/scripts/eval_configs.py`
 - `{onescience_path}/onescience/examples/matchem/mace/scripts/run_md.py`
+
+# resource_acquisition
+
+运行 MACE 前，orchestrator 必须按本契约**预检并主动获取**以下外部资源（库/权重），
+不得只在文件系统里 `find` 用户产物后就停滞；任一 `on_missing: fetch` 项缺失时应先尝试获取，
+获取失败再按 `degrade_to` 降级或标记 BLOCKED。所有 `sha256` 标 `待核验` 者须在首次成功下载后回填。
+
+```yaml
+resource_acquisition:
+  - dep: mace-torch                       # MACE 运行库（PyPI 官方包，非同名占位包）
+    kind: tool
+    source:
+      - {provider: pypi, id: mace-torch}
+    command: |
+      python3 -m pip install --upgrade pip
+      python3 -m pip install mace-torch
+    on_missing: fetch
+    verify: "python3 -c 'import mace; print(mace.__version__)'"
+
+  - dep: mace-mp0-universal-weights        # MACE-MP-0 通用势 foundation 权重（89 元素，微调/直接推理起点）
+    kind: model_weights
+    source:                                # 按优先级；沙箱无 HF 直连时用 hf-mirror 端点
+      - {provider: hf-mirror,   id: cyrusyc/mace-universal, endpoint: "https://hf-mirror.com"}
+      - {provider: huggingface, id: cyrusyc/mace-universal}
+      - {provider: github,      id: ACEsuit/mace-foundations, note: "MACE-MP-0 / 2023-12-10-mace-128-L0_epoch-249.model 等发布权重"}
+    command: |
+      python3 -m pip install -U "huggingface_hub[cli]"
+      export HF_ENDPOINT=https://hf-mirror.com          # 直连不可达时启用镜像
+      hf download cyrusyc/mace-universal --local-dir ./mace_weights
+    sha256: 待核验
+    size_hint: "~数百 MB（128-L0 medium 检查点）"
+    on_missing: fetch
+    degrade_to: "无网络且无本地权重时，改用 ASE 内置 EMT/有效介质势做流程冒烟，并显式声明非 MACE 精度"
+
+  - dep: lammps + mace-lammps 插件          # 仅当任务需 LAMMPS MD（如 CO2/Cu(111) 界面动力学）
+    kind: tool
+    source:
+      - {provider: conda-forge, id: lammps}
+      - {provider: github, id: ACEsuit/mace-lammps}
+    command: |
+      conda install -y -c conda-forge lammps            # 或按集群模块 module load lammps
+      python3 -m pip install mace-lammps                # ML-IAP pair style 插件
+    on_missing: fetch
+    verify: "lmp -h 2>&1 | grep -i mace || python3 -c 'import mace_lammps'"
+    degrade_to: "无 LAMMPS 时改用 ASE + MACECalculator 做短时 MD（ase.md），声明规模受限"
+```
+
+**获取要点（供 orchestrator 决策）**
+- 微调 foundation model 时**必须继承 checkpoint 的 `r_max`、元素表、hidden irreps**（见 implementation_risks），
+  下载权重后先 `MACECalculator(model_paths=...)` 做一次前向冒烟再进入训练/MD。
+- 沙箱/内网环境 HuggingFace 常直连不可达：统一用 `HF_ENDPOINT=https://hf-mirror.com`；
+  国内可另试 modelscope 镜像仓库。
+- 若用户未提供初始结构（如 `{C12_STRUCTURE}`），本卡不负责造结构；见场景流程卡的 `input_structure` 获取/构建契约。
+

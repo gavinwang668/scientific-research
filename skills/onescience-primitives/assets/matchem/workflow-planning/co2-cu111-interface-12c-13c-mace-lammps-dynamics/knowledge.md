@@ -182,3 +182,57 @@
 - **模型结果**：势能模型来源与版本说明、训练数据血缘、独立测试误差、最差构型审查、适用范围和是否可进入短时动力学的结论。
 - **动力学结果**：C12/C13 各自 2 ps 短时动力学的运行质量报告，包括实际有效时长、温度、能量、约束检查、轨迹、续算能力、异常和日志证据。
 - **结论结果**：对模型和短时动力学可用性的 PASS、PARTIAL、REJECT 或 BLOCKED 判定；仅在证据支持时提出后续长时采样建议，并明确当前不能得出的同位素结论。
+
+## resource_acquisition（结构化获取契约）
+
+本场景引用的结构/数据/势能/工具**均不随场景包提供**。orchestrator 不得只在 `/data` 下反复 `find`
+用户产物后停滞；应按下列顺序**主动获取或构建**，取不到再降级/标记 BLOCKED（并给出根因），
+不得既不获取也不干净收口。模型权重与 LAMMPS 安装见 `matchem/models/mace` 卡的 `resource_acquisition`。
+
+```yaml
+resource_acquisition:
+  - dep: "{C12_STRUCTURE} / {C13_STRUCTURE}"   # CO2/Cu(111)/水/K 界面初始结构
+    kind: input_structure
+    source:
+      - {provider: user_upload, id: "会话工作区/用户附加文件", note: "优先：用户提供的收敛 DFT 结构"}
+      - {provider: build, id: "ase", note: "无用户结构时用 ASE 构建：Cu(111) slab + CO2 吸附 + 水层 + K"}
+      - {provider: database, id: "Materials Project / OC20", note: "可检索 Cu(111)/CO2 吸附参考构型作为起点"}
+    command: |
+      python3 -m pip install ase
+      # 示例：构建 Cu(111) 3x3 slab，底部两层固定，吸附 CO2，加显式水/K（同位素 12C/13C 各一份）
+      python3 - <<'PY'
+      from ase.build import fcc111, add_adsorbate
+      from ase.constraints import FixAtoms
+      from ase.io import write
+      slab = fcc111('Cu', size=(3,3,4), vacuum=10.0)
+      z = slab.get_positions()[:,2]
+      slab.set_constraint(FixAtoms(mask=z < sorted(set(z.round(3)))[1] + 0.1))  # 固定底部两层
+      add_adsorbate(slab, 'CO2', height=2.0, position='ontop')
+      write('c12_interface.extxyz', slab)   # 13C 版：将 CO2 中 C 质量数改为 13 后另存
+      PY
+    on_missing: build
+    verify: "python3 -c \"from ase.io import read; a=read('c12_interface.extxyz'); print(len(a), a.constraints)\""
+    note: "构建结构仅用于流程/稳定性验证；不得冒称为用户的收敛 DFT 输入，须在报告中标注来源=build"
+
+  - dep: "{TRAINING_DATA} / {CANDIDATE_POTENTIAL}"   # 训练/验证数据与候选势能
+    kind: model_weights
+    source:
+      - {provider: reuse, id: "MACE-MP-0 通用势", note: "无体系专用训练数据时，复用 MACE-MP-0 做独立验证"}
+    command: "见 matchem/models/mace 卡 resource_acquisition（mace-mp0-universal-weights）"
+    on_missing: fetch
+    degrade_to: "无专用 DFT 标签时，用 MACE-MP-0 直接推理并声明未经体系内训练，验证结论限定为运行质量"
+
+  - dep: lammps + mace-lammps                  # 3×3 扩胞短时 MD 执行环境
+    kind: tool
+    source:
+      - {provider: conda-forge, id: lammps}
+      - {provider: github, id: ACEsuit/mace-lammps}
+    command: "见 matchem/models/mace 卡 resource_acquisition（lammps + mace-lammps 插件）"
+    on_missing: fetch
+    degrade_to: "无 LAMMPS 时用 ASE + MACECalculator 跑 2 ps NVT（ase.md），声明引擎替代与规模受限"
+```
+
+**收口要求**：若上述任一 `on_missing: fetch/build` 项在尝试获取/构建后仍不可得，
+必须产出"失败交付"（见上节：最后健康产物 + 失败位置 + 根因 + 已排除原因 + 下一步），
+并显式标记 BLOCKED，**禁止**停在中间态不返回。
+

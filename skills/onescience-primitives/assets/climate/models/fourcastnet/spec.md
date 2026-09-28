@@ -98,3 +98,57 @@ patch 输出头与恢复
 - `{onescience_path}/onescience/src/onescience/modules/afno/fourcastnetafno.py`
 - `{onescience_path}/onescience/src/onescience/modules/embedding/fourcastnetembedding.py`
 - `{onescience_path}/onescience/src/onescience/modules/fc/fourcastnetfc.py`
+
+# resource_acquisition
+
+区域化移植 FourCastNet 需要**预训练权重 + 再分析数据 + 运行库**，三者均不随场景包提供。
+orchestrator 应按本契约预检并主动获取，取不到再降级/BLOCKED，不得停在方案阶段。
+
+```yaml
+resource_acquisition:
+  - dep: fourcastnet-weights                 # FourCastNet v2 (SFNO) 预训练权重
+    kind: model_weights
+    source:
+      - {provider: hf-mirror,   id: OneScience-Group/FourCastNet_v2, endpoint: "https://hf-mirror.com"}
+      - {provider: huggingface, id: OneScience-Group/FourCastNet_v2}
+      - {provider: ngc,         id: nvidia/modulus/modulus_fcnv2_sm, note: "NGC Catalog 官方 checkpoint 包"}
+      - {provider: huggingface, id: nvidia/fourcastnet3, note: "如需 v3 概率预报版"}
+    command: |
+      python3 -m pip install -U "huggingface_hub[cli]"
+      export HF_ENDPOINT=https://hf-mirror.com
+      hf download OneScience-Group/FourCastNet_v2 --local-dir ./fcn_weights
+      # 或经 earth2studio：python3 -m pip install earth2studio，其 px.SFNO 会从 NGC 拉取
+    sha256: 待核验
+    on_missing: fetch
+    degrade_to: "无权重时用小分辨率随机初始化跑通前向流程冒烟，声明未取得预训练权重、非预报精度"
+
+  - dep: era5-reanalysis                     # 30 年高精度再分析数据（迁移训练/微调）
+    kind: dataset
+    source:
+      - {provider: cds, id: "ERA5 (Copernicus CDS)", note: "需 API token；0.25° 等距柱状网格"}
+      - {provider: nasa, id: "MERRA-2 / GES DISC", note: "替代再分析源"}
+    command: |
+      python3 -m pip install cdsapi
+      # 配置 ~/.cdsapirc 后按变量/时段检索下载；大体积建议分年分块
+    on_missing: fetch
+    degrade_to: "无 token/无网络：用样本子集或合成场做数据管线冒烟，声明未取得全量再分析"
+
+  - dep: modulus / earth2studio + torch      # 运行库
+    kind: tool
+    source:
+      - {provider: pypi, id: earth2studio}
+    command: "python3 -m pip install torch numpy earth2studio"
+    on_missing: fetch
+    verify: "python3 -c 'import torch; print(torch.__version__, torch.cuda.is_available())'"
+
+  - dep: GPU 集群（曙光）                     # 迁移训练/微调算力
+    kind: compute
+    source:
+      - {provider: hpc, id: "目标曙光 GPU 集群", note: "训练/微调需 GPU；提交前按分区与配额预检"}
+    on_missing: block
+    degrade_to: "CPU-only 环境不可行全量迁移训练；仅能做小样本前向/推理冒烟，须显式声明算力受限"
+```
+
+**要点**：区域化移植涉及开放边界约束与位置编码分辨率匹配（见 implementation_risks），
+下载权重后先核对 patch 网格与目标区域分辨率，再进入迁移训练；GPU 缺失时按 `degrade_to` 限定为冒烟。
+

@@ -114,6 +114,12 @@ type: orchestrator
 
 **任务语义触发**：任务描述为完整端到端流程（如"复现论文X并发布到ModelScope"、"从论文到训练到推理一条龙"），用户已明确表达了完成全部步骤的意图。
 
+**执行型任务默认触发（能力中心场景派发）**：当用户请求是"完成/执行某个可执行任务、可复现研究任务、端到端流程"这类**执行型意图**（典型措辞：`完成…可执行任务`、`完成…可复现研究任务`、`开展…验证`、`执行…`、`跑通…`、`产出…结果`、`获得可验证的…结果`），即使未出现上述显式触发词，也**默认设置 `autonomous_mode: true`**——能力中心"使用→发送"派发的场景本意就是把任务真正跑完，而不是停在方案层等确认。
+
+**反向豁免（仍走非自主、停在方案待确认）**：仅当用户请求**显式要求"先出方案、经我确认后再执行"**时才不自动进入 autonomous_mode，典型措辞：`先给方案不要执行`、`等我确认后再跑`、`只做规划不要动手`、`方案确认后再实施`。
+
+**关键区分——科学严谨性约束 ≠ 停在方案层**：执行型场景常同时带有"请先评估数据/模型/资源是否足够，自主提出并论证执行方案；方案确认前不得把实现细节、历史案例或目录默认值当作不可变科学结论"这类措辞。该约束的真实目的是**禁止把未经实验验证的实现细节/历史案例/默认值当成科学结论**，**不是要求停在方案层不执行**。因此对这类场景：**仍设 `autonomous_mode: true` 并一路执行到产出可验证结果与落盘文件**，只是在最终输出中对未经本次实验验证的数值/结论标注 `proposed_candidate` / `pending_verification`，且不得自判 PASS（遵守 C/D 层 result_identity 门禁）。
+
 ### autonomous_mode 下的行为变化
 
 1. **Global Plan 输出简化**：仍输出 Global Plan 给用户看，但末尾追加提示：
@@ -240,6 +246,24 @@ Block 时的写入格式：
 - 每次执行探索动作前检查：对应类别的 `used < max_attempts` 且 `wallclock_seconds_used < max_wallclock_seconds`
 - 若任一条件不满足 → 跳过探索，直接按 `on_exhausted` 策略处理
 - 测速类操作（`curl -r ... -o /dev/null`、`timeout ... curl` 等）只允许执行 `speed_measurement.max_attempts` 次不同测速策略的测试；同一策略的重复执行视为同一次尝试
+
+## 可视化交付契约（Visualization Delivery Contract，执行型任务默认强制）
+
+**适用范围**：`autonomous_mode=true` 的执行型任务（能力中心场景派发、端到端复现/评测/预测/设计类）。纯查询/纯安装/纯配置类任务豁免。
+
+**核心原则**：OneCode 会话文件面板**只渲染 HTML、不渲染 PNG**（PNG 在面板中打开为 base64 文本，不可读）。因此可视化交付物必须以**自包含 HTML** 为第一载体；PNG 仅作为 HTML 的内嵌素材或离线兜底，**不得作为唯一可视化交付物**。执行型任务"跑通"的定义包含"产出可在会话内直接预览的可视化报告"，而非仅文字方案或裸指标。
+
+**强制交付物**（在判定 `complete` / `complete_with_caveats` 收尾之前产出，落盘到任务输出目录）：
+1. `REPORT_single.html`：**单文件自包含**报告——核心图表以 base64 内嵌（`<img src="data:image/png;base64,...">`）或内联 SVG，**零外链**（不引用任何 CDN/网络 CSS/JS/字体），内容含：任务名、关键指标数值表、≥1 张核心图、方法与数据来源说明、真实性/证据边界标注。
+2. `interactive.html`（推荐）：Plotly 或等价的多面板交互页，同样零外链自包含。
+3. 图表配色与版式遵循已召回的 `scientific_visualization` / 域可视化原语规范；未召回到可视化原语时按默认出版级规范（dpi≥150、色盲友好 colormap、坐标轴带单位与图例）。
+4. **空图自检**：出图后逐 panel 校验非空且 `np.std>0`，空图/纯白图必须先调试重画，禁止交付空图。
+
+**生成方式**：优先委派 `onescience-data-analyzer`（或等价 executor）用 matplotlib/plotly 出图并内嵌；base64 内嵌用 `base64.b64encode(open(png,'rb').read()).decode()` 拼入 `<img>`，确保单文件离线可打开。
+
+**完成门禁挂钩**：step 11 的 D 层 complete 门禁与 tier_check 判定终态**之前**，必须检查 `REPORT_single.html` 已落盘且非空、零外链、含内嵌图；缺失则不得标 complete，先补产可视化再收尾；仅当补产确实失败时才允许 `complete_with_caveats` 并在最终输出首行注明"可视化交付缺失"。
+
+**会话内可见性**：最终输出必须以"文件/大小/说明"表格列出 `REPORT_single.html` 等交付物及其工作区相对路径，并提示用户在 OneCode 会话右侧文件面板点开即预览（HTML 预览为平台内置能力）。
 
 ## 工作流程
 
@@ -568,7 +592,7 @@ tiered_completion_contract:
 
    **D. 验收层门禁（验证 FAIL 级联回退 + complete_with_caveats，修验证失败后仍判 PASS/complete）**：
    - **级联回退**：验证类 step（网格独立性/能量守恒/可复现审计/指标对标等）判 FAIL 时，orchestrator 必须**自动回退**其上游所有已标 PASS 的 step：PASS → `UNVERIFIED`（产物被失败验证覆盖）或 `PARTIAL`；回退动作写入 `validation_rollback` event 并向 gaps.jsonl 追加 `gate_hit=validation_rollback`，不得静默。
-   - **complete 门禁**：`task_state.status=complete` 的前提是**同时满足**：① 所有 step 的 `result_identity=research_result`；② 所有验证类 step PASS；③ 无未解除的 `blocked_missing` 参数。任一不满足时 status 只能是 `complete_with_caveats`（工程链跑通但存在 not_a_result/DEMO_PASS 或验证 PARTIAL）、`partial`（验证 FAIL 且无可交付回退产物）或 `blocked`；降级动作向 gaps.jsonl 追加 `gate_hit=complete_downgrade`。
+   - **complete 门禁**：`task_state.status=complete` 的前提是**同时满足**：① 所有 step 的 `result_identity=research_result`；② 所有验证类 step PASS；③ 无未解除的 `blocked_missing` 参数；④ **可视化交付契约满足**（`REPORT_single.html` 已落盘且非空、零外链、含内嵌图，见"可视化交付契约"节）。任一不满足时 status 只能是 `complete_with_caveats`（工程链跑通但存在 not_a_result/DEMO_PASS 或验证 PARTIAL 或可视化缺失）、`partial`（验证 FAIL 且无可交付回退产物）或 `blocked`；降级动作向 gaps.jsonl 追加 `gate_hit=complete_downgrade`。
    - **结论前置标注**：`complete_with_caveats` / `partial` 状态下，最终输出**第一行必须**前置：「⚠ 本次未产生科研结论，以下为方法演示/工程脚手架输出，验证状态：<FAIL/PARTIAL 明细>」；禁止把演示数值（如「最大温升 1.03 K」「换热系数 35249 W/(m²·K)」「无热点」）写进「关键发现」段。
    - **禁止无条件完成自述**：存在验证 FAIL 或任一 `not_a_result` step 时，禁止输出「任务已完成，所有步骤均有可追溯证据链」这类无条件完成自述；必须改为「工程链已跑通，但科研验证未通过（明细），本次不产生科研结论」。
 
@@ -641,6 +665,9 @@ tiered_completion_contract:
       - 进入 blocked 状态
       - 恢复后 `attempt` 递增，预算 = `original_budget * budget_multiplier_on_retry`
     - 如果 `blocked`：
+      - **【强制 provision 前置门禁】** 在因"缺少资源 / 依赖 / 数据 / 模型"进入 blocked 之前，必须先按 `resource_acquisition` 对该缺失项分类，禁止"发现缺啥就直接停"：
+        * `acquirable`（可 pip/conda 安装的库、可公开下载的数据集 / 开放模型权重、可达镜像如 `HF_ENDPOINT=https://hf-mirror.com`）→ **不得 blocked**：库缺失改判 `failure_category=environment` 走 `delegate_to_installer` 自动安装后继续；数据 / 权重缺失改判 `failure_category=data` 走 `retry_re_fetch` 自动下载后继续。
+        * `hard_blocked`（需 API Key、商业许可证如 VASP/Gaussian、不可达的私有 / 内网资源、超出本机算力的硬约束）→ 才允许 blocked；且 blocked 前必须先把所有 `acquirable` 部分真正执行并落盘交付（代码 / 结果 / 指标 / 图 / 自包含 HTML 报告 `REPORT_single.html`），并在 gaps.jsonl 追加 `gate_hit=hard_block_only` 记录"已交付部分 + 唯一硬阻塞项"。
       - 记录阻断原因、缺失输入或外部依赖
       - 若可通过重新规划消除阻断，则在同一循环中继续；否则保持 blocked 状态等待外部条件变化
 

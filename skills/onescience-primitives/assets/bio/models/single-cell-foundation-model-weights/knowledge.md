@@ -42,11 +42,12 @@ snapshot_download(repo_id="MPRG/Mouse-Genecorpus-20M", local_dir="./mouse_genefo
 - 首次下载可能需要较长时间（模型文件较大）
 - 建议使用 `cache_dir` 参数指定下载目录
 
-**scGPT（GitHub）**：
+**scGPT（GitHub 提供代码，权重走外链/HF 镜像）**：
 ```bash
-git clone https://github.com/bowang-lab/scGPT.git
-# 预训练权重在 models/ 目录下
+git clone https://github.com/bowang-lab/scGPT.git   # 仅代码；权重不在此仓库
+# 预训练 checkpoint 见仓库 README 外链，或经 hf-mirror 拉取 tdc/scGPT（见文末 resource_acquisition 契约）
 ```
+> 注：`models/` 目录不含官方权重，勿假设 clone 后即有权重；结构化获取见文末 `resource_acquisition`。
 
 ### 3. 架构验证
 - **Geneformer**：6层Transformer Encoder，4个注意力头，256维嵌入，512维前馈层，最大输入长度2048 [1][3]
@@ -122,3 +123,67 @@ print(output.logits.shape)  # 应为 (1, num_classes)
 [1] Ito K et al. Mouse-Geneformer: A deep learning model for mouse single-cell transcriptome and its cross-species utility. PLOS Genetics, 2025, DOI: 10.1371/journal.pgen.1011420
 [2] Chen J et al. Assessing scale and predictive diversity in models for single-cell transcriptomics based on Geneformer. PLOS Computational Biology, 2026, DOI: 10.1371/journal.pcbi.1013701
 [3] Liu Y et al. Gene-Chronos: parameter-efficient developmental time inference using a pretrained single-cell foundation model. Briefings in Bioinformatics, 2026, DOI: 10.1093/bib/bbag469
+
+## resource_acquisition（结构化获取契约）
+
+orchestrator 在进入下游任务前必须按本契约**预检并主动获取**权重与依赖库；
+`on_missing: fetch` 项缺失时先获取，失败再按 `degrade_to` 降级或标记 BLOCKED，
+不得停在"评估+方案"阶段而不落地。`sha256` 标 `待核验` 者须在首次成功下载后回填。
+
+> ⚠️ 勘误（实测纠偏）：scGPT 官方权重**不在** `bowang-lab/scGPT` git 仓库的 `models/` 目录里，
+> 该仓库 README 仅提供外链（Google Drive / HF）。沙箱直连 HuggingFace 常不可达，
+> 统一用 `HF_ENDPOINT=https://hf-mirror.com`；Geneformer 在镜像上实际可达仓库名为 `ctheodoris/Geneformer`。
+
+```yaml
+resource_acquisition:
+  - dep: geneformer-weights                 # Geneformer（human）预训练权重
+    kind: model_weights
+    source:
+      - {provider: hf-mirror,   id: ctheodoris/Geneformer,      endpoint: "https://hf-mirror.com"}
+      - {provider: huggingface, id: ctheodoris/Geneformer}
+      - {provider: huggingface, id: ctheodoris/Genecorpus-30M, note: "预训练语料/词表相关仓库"}
+    command: |
+      python3 -m pip install -U "huggingface_hub[cli]" transformers
+      export HF_ENDPOINT=https://hf-mirror.com
+      hf download ctheodoris/Geneformer --local-dir ./geneformer_weights
+    license: CC-BY-NC-SA-4.0
+    sha256: 待核验
+    on_missing: fetch
+    degrade_to: "无权重时冻结骨干不可行；改做数据侧预处理与 SAE 流程冒烟，声明未取得 Geneformer 表征"
+
+  - dep: scgpt-weights                       # scGPT 预训练权重（whole-human 推荐）
+    kind: model_weights
+    source:
+      - {provider: github,      id: bowang-lab/scGPT, note: "README 内 checkpoint 外链（官方发布）"}
+      - {provider: hf-mirror,   id: tdc/scGPT,        endpoint: "https://hf-mirror.com"}
+      - {provider: huggingface, id: tdc/scGPT}
+      - {provider: huggingface, id: perturblab/scgpt-continual-pretrained, note: "同源再上传，便于 HF 加载"}
+    command: |
+      export HF_ENDPOINT=https://hf-mirror.com
+      hf download tdc/scGPT --local-dir ./scgpt_weights
+      # 或 python3 -m pip install scgpt 后按包内说明指定 checkpoint 路径
+    license: MIT
+    sha256: 待核验
+    on_missing: fetch
+    note: "镜像存在多个 scGPT 仓库（btdc/scGPT、MohamedMabrouk/scGPT 等），须核对与官方 whole-human checkpoint 一致后再用"
+
+  - dep: scanpy + anndata + transformers     # 单细胞下游运行库
+    kind: tool
+    source:
+      - {provider: pypi, id: scanpy}
+    command: |
+      python3 -m pip install scanpy anndata transformers
+    on_missing: fetch
+    verify: "python3 -c 'import scanpy, anndata, transformers; print(scanpy.__version__)'"
+
+  - dep: immune_atlas.h5ad                   # 场景默认输入示例数据（若本地不存在）
+    kind: dataset
+    source:
+      - {provider: cellxgene-census, id: "cellxgene_census", note: "HTTP 200 可达，可按查询下载免疫图谱子集"}
+    command: |
+      python3 -m pip install cellxgene-census
+      python3 -c "import cellxgene_census; adata=cellxgene_census.download_source_h5ad(...); adata.write_h5ad('immune_atlas.h5ad')"
+    on_missing: fetch
+    degrade_to: "CPU-only 环境按 Tier 1 子采样 ~1000–2000 细胞；无网络时用内置小样本 AnnData 冒烟流程"
+```
+
