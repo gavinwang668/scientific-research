@@ -119,7 +119,16 @@ def _dir_ok(path: Path) -> ProbeEntry:
         entry.reason = "permission denied"
         return entry
     try:
-        entry.non_empty = any(path.iterdir())
+        # Only count *visible* files (recursively). Failed/interrupted
+        # downloads leave residue skeletons (.lock/, ._____temp/,
+        # OneScience/<repo>/.mdl) that are technically non-empty but
+        # contain no usable data; treating them as hits would mask the
+        # need for a re-download.
+        entry.non_empty = any(
+            p.is_file() and not any(part.startswith(".")
+                                    for part in p.relative_to(path).parts)
+            for p in path.rglob("*")
+        )
     except OSError as exc:
         entry.reason = f"list failed: {exc}"
         return entry

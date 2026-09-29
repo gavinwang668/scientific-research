@@ -53,16 +53,20 @@ class DeepCFDAdapter(BaseAdapter):
         case_dirs: List[Path] = []
         monolithic: Optional[Path] = None
 
-        # Layout A: paired at any depth (prefer shallowest).
+        # Layout A: a single aggregated X/Y pair anywhere in the tree.
+        # Collect every sibling X/Y pair; only treat as the aggregated
+        # "paired" layout when exactly one pair exists. Multiple pairs
+        # (e.g. per-case subdirs each with X.pkl+Y.pkl) fall through to
+        # Layout B below, since X.pkl/Y.pkl naming overlaps between A/B.
+        all_pairs: List[Tuple[Path, Path]] = []
         for p in pkl_files:
             if p.name in X_NAMES:
                 for q in pkl_files:
                     if q.parent == p.parent and q.name in Y_NAMES:
-                        paired_root = (p, q)
-                        layout = "paired"
-                        break
-            if paired_root:
-                break
+                        all_pairs.append((p, q))
+        if len(all_pairs) == 1:
+            paired_root = all_pairs[0]
+            layout = "paired"
 
         # Layout B: per-case directories.
         if layout == "unknown":

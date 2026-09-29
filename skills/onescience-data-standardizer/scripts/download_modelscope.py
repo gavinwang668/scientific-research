@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -76,19 +77,51 @@ def cache_dir_for(dataset_name: str) -> Path:
     return CACHE_ROOT / dataset_name / "raw"
 
 
+def _visible_files(root: Path):
+    """Yield data files under root, ignoring hidden bookkeeping parts.
+
+    The ModelScope SDK leaves residue such as .lock/, ._____temp/ and
+    .mdl/.msc metadata inside the cache tree; counting those would let an
+    interrupted or empty download look like a populated cache. This mirrors
+    the visible-file rule in resolve_source.py::_dir_ok so cache-hit
+    detection, stats and residue cleanup all share one criterion.
+    """
+    for p in root.rglob("*"):
+        if p.is_file() and not any(part.startswith(".")
+                                   for part in p.relative_to(root).parts):
+            yield p
+
+
 def _dir_stats(root: Path) -> Dict[str, int]:
     total_bytes = 0
     files = 0
-    for p in root.rglob("*"):
-        if p.is_file():
-            files += 1
-            with contextlib.suppress(OSError):
-                total_bytes += p.stat().st_size
+    for p in _visible_files(root):
+        files += 1
+        with contextlib.suppress(OSError):
+            total_bytes += p.stat().st_size
     return {"bytes": total_bytes, "files": files}
 
 
 def _cache_is_populated(cache_dir: Path) -> bool:
-    return cache_dir.exists() and cache_dir.is_dir() and any(cache_dir.iterdir())
+    return (cache_dir.exists() and cache_dir.is_dir()
+            and any(True for _ in _visible_files(cache_dir)))
+
+
+def _cleanup_residue(dataset_name: str) -> None:
+    """Remove the per-dataset cache root left behind by failed downloads.
+
+    The ModelScope SDK writes bookkeeping artifacts (.lock/, ._____temp/,
+    OneScience/<repo>/.mdl) into CACHE_ROOT/<name> even when the download
+    fails. Such residue makes resolve_source.py's local probe see a
+    "non-empty" directory and masks the need for a re-download, so delete
+    the whole root unless it holds a populated cache or visible files.
+    """
+    root = CACHE_ROOT / dataset_name
+    if _cache_is_populated(root / "raw"):
+        return
+    has_visible_file = root.exists() and any(True for _ in _visible_files(root))
+    if not has_visible_file:
+        shutil.rmtree(root, ignore_errors=True)
 
 
 @contextlib.contextmanager
@@ -231,20 +264,28 @@ def _download_via_git_lfs(repo_id: str, repo_type: str,
 
 def _classify_error(msg: str) -> str:
     low = msg.lower()
+    if "401" in low or "403" in low or "auth" in low or "token" in low:
+        return "authentication_failed"
+    # Network signals take precedence over repo-phrasing: DNS/outage
+    # tracebacks mention connection paths and modelscope's wrapper line
+    # may say "repo ... not exist", which must not mask a network error
+    # (network errors are retryable, repo_not_found short-circuits).
+    # "connectionpool"/"max retries" cover urllib3 wrappers; "timed out"
+    # covers socket timeouts phrased without the word "timeout".
+    if re.search(r"connection|\btimeout\b|timed out|\bnetwork\b|name resolution"
+                 r"|gaierror|unreachable|temporarily unavailable"
+                 r"|max retries", low):
+        return "network_error"
+    if "space" in low or "quota" in low or "disk" in low:
+        return "insufficient_disk_space"
+    if "checksum" in low or "hash" in low or "corrupt" in low:
+        return "checksum_mismatch"
     # repo-not-found: cover both "does not exist" and modelscope's
     # "not exists" / "not exist" phrasing, plus HTTP 404.
     if ("404" in low or "not found" in low or "does not exist" in low
             or "not exists" in low or "not exist" in low
             or "repo" in low and "exist" in low):
         return "repo_not_found"
-    if "401" in low or "403" in low or "auth" in low or "token" in low:
-        return "authentication_failed"
-    if "space" in low or "quota" in low or "disk" in low:
-        return "insufficient_disk_space"
-    if "timeout" in low or "connection" in low or "network" in low:
-        return "network_error"
-    if "checksum" in low or "hash" in low or "corrupt" in low:
-        return "checksum_mismatch"
     return "download_failed"
 
 
@@ -327,6 +368,7 @@ def download(dataset_name: str,
 
         if chosen is None:
             shutil.rmtree(tmp_dir, ignore_errors=True)
+            _cleanup_residue(dataset_name)
             raise last_error or DownloadError("download failed",
                                               reason="download_failed")
 

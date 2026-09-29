@@ -23,9 +23,11 @@
 
 固定为：`~/.onescience/datasets/<dataset_name>/raw/`
 
-- 若目录已存在且非空 → 视为已下载，跳过下载直接使用（幂等）。
+- **命中判定采用"递归可见文件"口径**：目录存在且含至少一个非隐藏文件（路径各段均不以 `.` 开头）→ 视为已下载，跳过下载直接使用（幂等，`method=cache_hit`）。
+- 仅含隐藏残留（`.lock/`、`._____temp/`、`.mdl`/`.msc` 元数据等 SDK 记账产物）→ **视为未下载**，走正常下载流程；隐藏残留不会造成假命中（与 `resolve_source.py::_dir_ok` 同一口径）。
 - 若目录存在但为空 → 删除后重新下载。
-- 下载过程使用**临时目录**（`~/.onescience/datasets/<dataset_name>/.raw.tmp.<pid>/`），完成后 `os.rename` 到最终位置，避免半完成状态污染缓存。
+- 下载过程使用**临时目录**（`~/.onescience/datasets/<dataset_name>/.raw.tmp.<pid>/`），完成后移动到最终位置，避免半完成状态污染缓存。
+- **失败残留自动清理**：三级路径全部失败后，删除临时目录并调用 `_cleanup_residue`——若数据集缓存根下无 populated cache 且无任何可见文件，则整目录移除残留骨架，保证下次运行能重新触发下载而不是被残留骗成"本地已有数据"。
 
 ## 下载执行
 
@@ -46,10 +48,11 @@ local_path = snapshot_download(
 ### 降级路径：ModelScope CLI
 
 ```bash
-modelscope download --repo-type dataset --repo-id <repo_id> --local_dir <cache_dir>
+modelscope download --dataset <repo_id> --repo-type dataset --local_dir <cache_dir>
+# 模型仓库则用 --model <repo_id> --repo-type model
 ```
 
-依赖：`modelscope` CLI 在 `PATH` 中。
+依赖：`modelscope` CLI 在 `PATH` 中。注意 CLI v1.37+ **没有 `--repo-id` 参数**，repo 通过 `--dataset`/`--model` 传入。
 
 ### 二级降级：Git LFS
 
@@ -70,14 +73,24 @@ git clone https://www.modelscope.cn/datasets/<repo_id>.git <cache_dir>
 
 ## 失败降级
 
-| 失败类型 | 处理 |
-|---|---|
-| SDK/CLI 都不可用 | `status=blocked, blocked_reason=download_failed, blocked_details="modelscope sdk/cli not available; install with: pip install modelscope"` |
-| Repo 不存在（404） | `status=blocked, blocked_reason=download_failed, blocked_details="repo not found: <repo_id>"`；同时在 `observation.next_recommendation` 中建议用户核对 repo_id 或手工提供 source_dir |
-| 认证失败（401/403） | `status=blocked, blocked_reason=download_failed, blocked_details="authentication required; set MODELSCOPE_API_TOKEN"` |
-| 网络中断/超时 | 重试最多 3 次，指数退避（1s / 4s / 16s）；仍失败 → `status=blocked, blocked_reason=download_failed` |
-| 磁盘空间不足 | `status=blocked, blocked_reason=download_failed, blocked_details="insufficient disk space; required=<X>, available=<Y>"` |
-| 部分文件损坏（checksum mismatch） | 删除缓存目录并重试 1 次；仍失败 → `status=blocked` |
+失败分类由 `download_modelscope.py::_classify_error` 产出，**细分 reason 直接透传为
+`blocked_reason`**（不再统一为 `download_failed`）。分类优先级：认证 → 网络 → 磁盘 →
+校验和 → 仓库不存在 → 兜底。**网络信号优先于 repo 措辞**：DNS/断网 traceback 中常混有
+"repo ... not exist" 字样，若先匹配 repo 规则会把可重试的网络故障误判为不可重试的
+`repo_not_found`（已修复的实测缺陷）。
+
+| 失败类型 | `blocked_reason` | 行为 |
+|---|---|---|
+| SDK 与 CLI 均未安装 | `download_failed` | `blocked_details` 提示 `pip install modelscope` |
+| 网络故障（DNS 解析失败 / 连接拒绝 / 超时 / max retries） | `network_error` | **可重试**：SDK 最多 3 次、指数退避（1s/4s/16s）；仍失败降级 CLI，再降级 git-lfs（需显式开启） |
+| Repo 不存在（404 / not exist(s) / does not exist） | `repo_not_found` | **不可重试**：SDK 立即短路，仍尝试 CLI 与 git-lfs 各一次；`next_recommendation` 建议核对 repo_id 或手工提供 source_dir |
+| 认证失败（401/403/auth/token） | `authentication_failed` | 不可重试路径同上；`blocked_details` 提示配置 `MODELSCOPE_API_TOKEN` |
+| 磁盘空间不足（space/quota/disk） | `insufficient_disk_space` | 不可重试路径同上 |
+| 文件损坏（checksum/hash/corrupt） | `checksum_mismatch` | 可重试（与 network_error 同预算）；下载先落临时目录，失败即整体废弃重来，无需单独"删缓存"步骤 |
+| 下载"成功"但缓存内无可见文件 | `download_failed` | 显式报 `download produced empty cache`，防止空仓库/元数据-only 静默假成功 |
+| 其他未知错误 | `download_failed` | 兜底分类 |
+
+任何失败路径统一执行：删除临时目录 → `_cleanup_residue` 清理隐藏残留骨架（见"缓存目录约定"）→ 抛出携带细分 reason 的 `DownloadError`。
 
 ## 幂等与并发
 
@@ -94,9 +107,9 @@ download_details:
   repo_id_source: explicit | spec_extract | metadata_extract | default_convention
   repo_type: dataset | model
   cache_dir: <绝对路径>
-  method: sdk | cli | git_lfs
-  bytes_downloaded: <int>
+  method: sdk | cli | git_lfs | cache_hit
+  bytes_downloaded: <int>      # 仅统计可见文件（隐藏元数据不计入）
   duration_seconds: <float>
-  files_count: <int>
+  files_count: <int>           # 同上，仅可见文件
   retries: <int>
 ```

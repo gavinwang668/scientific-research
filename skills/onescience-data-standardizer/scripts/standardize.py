@@ -261,6 +261,52 @@ REQUIRED_CARD_FIELDS = ("schema_version", "name", "domain", "handler",
                         "source", "target", "target_schema", "quality_checks")
 
 
+def normalize_splits_metadata(target_dir: Path) -> Optional[Dict[str, Any]]:
+    """Make splits/splits.json self-describing about where member indices live.
+
+    Consumers routinely expect the JSON entry point to carry per-split index
+    lists, but the contract stores them in sidecar files (npy arrays for
+    numeric splits, txt ID lists for era5/targetdiff) or, for sharded
+    layouts like oc20, inside data/<split>/. Inject an explicit
+    "indices_location" declaration so readers do not have to guess. No-op
+    when splits.json is absent, unreadable, or already declares the field;
+    never raises so a cosmetic step cannot break the pipeline.
+    """
+    splits_dir = target_dir / "splits"
+    splits_json = splits_dir / "splits.json"
+    if not splits_json.exists():
+        return None
+    try:
+        meta = json.loads(splits_json.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(meta, dict) or "indices_location" in meta:
+        return None
+    location: Dict[str, str] = {}
+    for split in ("train", "val", "test"):
+        for name in (f"{split}_indices.npy", f"{split}.txt"):
+            if (splits_dir / name).exists():
+                location[split] = f"splits/{name}"
+                break
+    if not location:
+        data_dir = target_dir / "data"
+        if data_dir.is_dir():
+            shards = sorted(d.name for d in data_dir.iterdir() if d.is_dir())
+            if shards:
+                location = {s: f"data/{s}/" for s in shards}
+                location["_layout"] = ("sharded members inside data/<split>/; "
+                                       "no sidecar index files")
+    if not location:
+        return None
+    meta["indices_location"] = location
+    try:
+        splits_json.write_text(
+            json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        return None
+    return location
+
+
 def validate_output(target_dir: Path, dataset_name: str,
                     domain: str) -> Dict[str, Any]:
     """Lightweight built-in validation (fallback for onescience-dataset-builder)."""
@@ -545,6 +591,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         _emit(execution_result, args.output)
         return 1
     execution_result["observation"]["completed"].append("convert")
+
+    # ---- Stage 4b: make splits.json self-describing (indices_location) ----
+    normalize_splits_metadata(target_dir)
 
     # ---- Stage 5: validate + register + report ----
     validation = validate_output(target_dir, dataset_name, domain)

@@ -22,6 +22,32 @@
 
 **可选项**：`static/`、`stats/`、`splits/` 按 primitives `spec.md` 决定是否创建；未创建时不必留空目录。
 
+### splits/ 与 splits.json 约定
+
+成员索引**存放在 sidecar 文件**而非 JSON 内部（避免大数据集下 splits.json 膨胀）：
+
+- 数值索引 → `splits/<split>_indices.npy`（如 deepcfd）；
+- ID/年份列表 → `splits/<split>.txt`（如 era5、targetdiff）；
+- 分片布局（如 oc20 aselmdb）→ 成员即 `data/<split>/` 下的分片，无 sidecar 索引文件。
+
+`splits/splits.json` 存元信息（strategy/seed/split_ratio/样本数），并且**必须包含
+`indices_location` 字段**显式声明索引位置，例如：
+
+```json
+{
+  "strategy": "random_permutation_fixed_seed",
+  "indices_location": {
+    "train": "splits/train_indices.npy",
+    "test": "splits/test_indices.npy"
+  }
+}
+```
+
+分片布局写作 `{"train": "data/train/", "_layout": "sharded members ..."}`。
+管线在校验前会自动补齐该字段（`standardize.py::normalize_splits_metadata`），
+converter 无需手写；消费者读取索引时应以 `indices_location` 为准，不要假设
+splits.json 内嵌索引列表。
+
 ## data/ 目录组织
 
 按 domain 惯例：
